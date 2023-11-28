@@ -9,7 +9,7 @@ go install github.com/frodejac/jwtool@latest
 
 ## Usage
 ```
-usage: jwtool [JWT] [option...]
+usage: jwtool [option...] [JWT]
   --ugly           don't pretty-print the output
   -H, --headers    include JWT headers in output
   -h, --help       print this help and exit

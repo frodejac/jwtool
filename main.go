@@ -12,7 +12,7 @@ import (
 	"strings"
 )
 
-const usage = `usage: jwtool [JWT] [option...]
+const usage = `usage: jwtool [option...] [JWT]
   --ugly           don't pretty-print the output
   -H, --headers    include JWT headers in output
   -h, --help       print this help and exit
