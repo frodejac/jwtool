@@ -32,6 +32,7 @@ usage: jwtool [option...] [JWT]
   -h, --help       print this help and exit
   --verify         verify the JWT signature
   --key            path to verification key (PEM for RS/ES/EdDSA, or raw secret file for HS*)
+  --jwks           path or URL to JWKS (used with --verify)
 
 Inspect a JWT and print its claims as JSON.
 
@@ -68,6 +69,8 @@ Examples:
 
 Notes:
 - Optional signature verification with `--verify` and `--key`. For RS/ES/EdDSA, `--key` should point to a PEM file containing a public (or private) key. For HS*, `--key` should point to a file containing the shared secret bytes.
+- Alternatively, verify with a JWKS using `--jwks <path-or-url>`. If a URL is provided, the JWKS is fetched over HTTP(S). Key selection uses the token's `kid`; if no `kid` and the JWKS has multiple keys, verification fails.
+- `--key` and `--jwks` are mutually exclusive.
 - On malformed input, an error is printed to stderr and the program exits non‑zero.
 
 Additional examples (verification):
@@ -83,6 +86,16 @@ Additional examples (verification):
   ```bash
   printf 'super-secret' > secret.key
   jwtool --verify --key secret.key "$JWT"
+  ```
+
+- Verify via JWKS from a file:
+  ```bash
+  jwtool --verify --jwks jwks.json "$JWT"
+  ```
+
+- Verify via JWKS from a URL:
+  ```bash
+  jwtool --verify --jwks https://issuer.example.com/.well-known/jwks.json "$JWT"
   ```
 
 ### Generate Client Assertion
