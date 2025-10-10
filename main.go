@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 )
@@ -31,6 +32,7 @@ const usage = `usage: jwtool [option...] [JWT]
   --key            path to verification key (PEM for RS/ES/EdDSA, or raw secret file for HS*)
   --jwks           path or URL to JWKS (used with --verify)
   assertion       generate a client assertion JWT
+  version         print version information
 
 Inspect a JWT and print its claims as JSON.
 
@@ -55,6 +57,7 @@ type mode int
 const (
 	modeInspect mode = iota
 	modeAssertion
+	modeVersion
 )
 
 var modeFlag mode
@@ -105,6 +108,8 @@ func init() {
 			os.Exit(1)
 		}
 		modeFlag = modeAssertion
+	} else if os.Args[1] == "version" {
+		modeFlag = modeVersion
 	} else {
 		flag.Parse()
 	}
@@ -116,7 +121,55 @@ func main() {
 		createAssertion()
 	case modeInspect:
 		inspect()
+	case modeVersion:
+		printVersion()
 	}
+}
+
+// These values are intended to be set via -ldflags at build time.
+// Defaults make sense for local builds.
+var (
+	Version string
+	Commit  string
+	Date    string
+)
+
+func printVersion() {
+
+	if info, ok := debug.ReadBuildInfo(); ok {
+		var rev, ts string
+		for _, s := range info.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				rev = s.Value
+			case "vcs.time":
+				ts = s.Value
+			}
+		}
+		if Version == "" && info.Main.Version != "" && info.Main.Version != "(devel)" {
+			Version = info.Main.Version
+		}
+		if Commit == "" && rev != "" {
+			Commit = rev
+		}
+		if Date == "" && ts != "" {
+			Date = ts
+		}
+	}
+
+	if Version == "" {
+		Version = "dev"
+	}
+	if Commit == "" {
+		Commit = "unknown"
+	}
+	if Date == "" {
+		Date = "unknown"
+	}
+
+	fmt.Printf("jwtool %s\n", Version)
+	fmt.Printf("Commit: %s\n", Commit)
+	fmt.Printf("Built: %s\n", Date)
 }
 
 func createAssertion() {

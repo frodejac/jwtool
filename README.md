@@ -33,6 +33,8 @@ usage: jwtool [option...] [JWT]
   --verify         verify the JWT signature
   --key            path to verification key (PEM for RS/ES/EdDSA, or raw secret file for HS*)
   --jwks           path or URL to JWKS (used with --verify)
+  assertion       generate a client assertion JWT
+  version         print version information
 
 Inspect a JWT and print its claims as JSON.
 
@@ -65,6 +67,14 @@ Examples:
 - Compact (no pretty-print):
   ```bash
   jwtool --ugly "$JWT"
+  ```
+
+- Version info:
+  ```bash
+  jwtool version
+  # jwtool v1.2.3
+  # Commit: abcdef1
+  # Built: 2024-10-10T12:34:56Z
   ```
 
 Notes:
