@@ -34,7 +34,6 @@ const clientAssertionUsage = `usage: jwtool assertion [option...]
   --clientid, --client    Client ID (required)
   --audience, --aud      Audience (required)
   --privatekey, --key    Path to RSA private key in PEM format (required)
-  --ugly                 don't pretty-print the output
   -h, --help             print this help and exit
 
 Generates a client assertion JWT signed with the provided RSA private key.
