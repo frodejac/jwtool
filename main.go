@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -19,6 +20,8 @@ const usage = `usage: jwtool [option...] [JWT]
   --ugly           don't pretty-print the output
   -H, --headers    include JWT headers in output
   -h, --help       print this help and exit
+  --verify         verify the JWT signature
+  --key            path to verification key (PEM for RS/ES/EdDSA, or raw secret file for HS*)
   assertion       generate a client assertion JWT
 
 Inspect a JWT and print its claims as JSON.
@@ -49,9 +52,10 @@ const (
 var modeFlag mode
 
 // Inspect flags
-// TODO: Signature verification
 var includeHeaders bool
 var uglyPrint bool
+var verifySig bool
+var verifyKeyPath string
 
 // Client Assertion flags
 var clientAssertion *flag.FlagSet
@@ -64,6 +68,8 @@ func init() {
 	flag.BoolVar(&includeHeaders, "headers", false, "Output the header content of the JWT along with claims")
 	flag.BoolVar(&includeHeaders, "H", false, "Output the headers content of the JWT")
 	flag.BoolVar(&uglyPrint, "ugly", false, "Don't pretty print")
+	flag.BoolVar(&verifySig, "verify", false, "Verify JWT signature")
+	flag.StringVar(&verifyKeyPath, "key", "", "Path to verification key (PEM for RS/ES/EdDSA, or raw secret file for HS*)")
 
 	clientAssertion = flag.NewFlagSet("assertion", flag.ExitOnError)
 	clientAssertion.Usage = func() { fmt.Print(clientAssertionUsage) }
@@ -74,19 +80,20 @@ func init() {
 	clientAssertion.StringVar(&privateKeyPath, "privatekey", "", "Path to RSA private key in PEM format")
 	clientAssertion.StringVar(&privateKeyPath, "key", "", "Path to RSA private key in PEM format")
 
-	if len(os.Args) < 2 {
+	if len(os.Args) < 1 {
 		flag.Usage()
 		os.Exit(1)
 	}
-	switch os.Args[1] {
-	case "assertion":
+
+	if len(os.Args) == 1 {
+		modeFlag = modeInspect
+	} else if os.Args[1] == "assertion" {
 		if err := clientAssertion.Parse(os.Args[2:]); err != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "Error parsing flags: %s\n", err)
 			os.Exit(1)
 		}
 		modeFlag = modeAssertion
-	default:
-		modeFlag = modeInspect
+	} else {
 		flag.Parse()
 	}
 }
@@ -164,10 +171,38 @@ func inspect() {
 
 	jwtString = strings.TrimSpace(jwtString)
 
-	token, err := jwt.Parse(jwtString, nil)
+	var token *jwt.Token
+	var err error
+	token, err = jwt.Parse(jwtString, nil)
 	if err != nil {
 		if !errors.Is(err, jwt.ErrTokenUnverifiable) {
 			_, _ = fmt.Fprintf(os.Stderr, "Error parsing JWT: %s\n", err)
+			os.Exit(1)
+		}
+	}
+
+	if verifySig {
+		if verifyKeyPath == "" {
+			_, _ = fmt.Fprintln(os.Stderr, "--verify requires --key to be provided")
+			os.Exit(1)
+		}
+		alg, ok := token.Header["alg"].(string)
+		if !ok || alg == "" {
+			_, _ = fmt.Fprintln(os.Stderr, "Cannot determine alg from token header")
+			os.Exit(1)
+		}
+		key, err := loadVerifyKey(alg, verifyKeyPath)
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "Error loading verification key: %s\n", err)
+			os.Exit(1)
+		}
+		token, err = jwt.Parse(jwtString, func(t *jwt.Token) (interface{}, error) { return key, nil }, jwt.WithValidMethods([]string{alg}), jwt.WithoutClaimsValidation())
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "Signature verification failed: %s\n", err)
+			os.Exit(1)
+		}
+		if !token.Valid {
+			_, _ = fmt.Fprintln(os.Stderr, "Signature verification failed: token invalid")
 			os.Exit(1)
 		}
 	}
@@ -200,4 +235,46 @@ func newJti() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+func loadVerifyKey(alg string, keyPath string) (interface{}, error) {
+	data, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("read key: %w", err)
+	}
+	a := strings.ToUpper(alg)
+	switch a {
+	case "HS256", "HS384", "HS512":
+		return data, nil // raw secret bytes
+	case "RS256", "RS384", "RS512":
+		if pub, err := jwt.ParseRSAPublicKeyFromPEM(data); err == nil {
+			return pub, nil
+		}
+		if priv, err := jwt.ParseRSAPrivateKeyFromPEM(data); err == nil {
+			return &priv.PublicKey, nil
+		}
+		return nil, fmt.Errorf("unable to parse RSA key from PEM")
+	case "ES256", "ES384", "ES512":
+		if pub, err := jwt.ParseECPublicKeyFromPEM(data); err == nil {
+			return pub, nil
+		}
+		if priv, err := jwt.ParseECPrivateKeyFromPEM(data); err == nil {
+			return &priv.PublicKey, nil
+		}
+		return nil, fmt.Errorf("unable to parse EC key from PEM")
+	case "EDDSA":
+		if pub, err := jwt.ParseEdPublicKeyFromPEM(data); err == nil {
+			return pub, nil
+		}
+		if priv, err := jwt.ParseEdPrivateKeyFromPEM(data); err == nil {
+			key, ok := priv.(ed25519.PrivateKey)
+			if !ok {
+				return nil, fmt.Errorf("not an Ed25519 private key")
+			}
+			return key.Public(), nil
+		}
+		return nil, fmt.Errorf("unable to parse Ed25519 key from PEM")
+	default:
+		return nil, fmt.Errorf("unsupported alg: %s", alg)
+	}
 }

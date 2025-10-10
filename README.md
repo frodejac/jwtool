@@ -30,6 +30,8 @@ usage: jwtool [option...] [JWT]
   --ugly           don't pretty-print the output
   -H, --headers    include JWT headers in output
   -h, --help       print this help and exit
+  --verify         verify the JWT signature
+  --key            path to verification key (PEM for RS/ES/EdDSA, or raw secret file for HS*)
 
 Inspect a JWT and print its claims as JSON.
 
@@ -65,8 +67,23 @@ Examples:
   ```
 
 Notes:
-- Signature verification is not performed. The tool parses and prints header/claims only.
+- Optional signature verification with `--verify` and `--key`. For RS/ES/EdDSA, `--key` should point to a PEM file containing a public (or private) key. For HS*, `--key` should point to a file containing the shared secret bytes.
 - On malformed input, an error is printed to stderr and the program exits non‑zero.
+
+Additional examples (verification):
+
+- Verify signature (RS256 with PEM public key):
+  ```bash
+  # If you have a private key, you can extract the public key
+  # openssl rsa -in private.pem -pubout -out pub.pem
+  jwtool --verify --key pub.pem "$JWT"
+  ```
+
+- Verify signature (HS256 with shared secret in a file):
+  ```bash
+  printf 'super-secret' > secret.key
+  jwtool --verify --key secret.key "$JWT"
+  ```
 
 ### Generate Client Assertion
 
@@ -77,7 +94,6 @@ usage: jwtool assertion [option...]
   --clientid, --client    Client ID (required)
   --audience, --aud      Audience (required)
   --privatekey, --key    Path to RSA private key in PEM format (required)
-  --ugly                 don't pretty-print the output
   -h, --help             print this help and exit
 ```
 
