@@ -1,6 +1,6 @@
 version: 1
 main: .
-binary: jwtool
+binary: jwtool-{{ .Os }}-{{ .Arch }}
 env:
   - CGO_ENABLED=0
 flags:
