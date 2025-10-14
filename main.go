@@ -7,8 +7,11 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -31,6 +34,7 @@ const usage = `usage: jwtool [option...] [JWT]
   --verify         verify the JWT signature
   --key            path to verification key (PEM for RS/ES/EdDSA, or raw secret file for HS*)
   --jwks           path or URL to JWKS (used with --verify)
+  jwks           convert keys to JWKS
   assertion       generate a client assertion JWT
   version         print version information
 
@@ -52,11 +56,27 @@ const clientAssertionUsage = `usage: jwtool assertion [option...]
 Generates a client assertion JWT signed with the provided RSA private key.
 `
 
+const jwksUsage = `usage: jwtool jwks [option...]
+  -in <path>           Input key file (PEM for RS/ES/EdDSA, certificate, or raw secret for HS*)
+  -out <path>          Output JWKS file (defaults to stdout)
+  --alg <alg>          Optional alg claim to set on each JWK
+  --use <use>          Optional use (e.g., 'sig' or 'enc') to set on each JWK
+  --kid <kid>          Optional key ID to set (only valid for a single key)
+  --private            Include private key material when applicable (not recommended)
+  --ext                Set "ext" (extractable) to true on each JWK'
+  --ugly               Don't pretty-print output
+
+Convert keys to a JWKS (JSON Web Key Set). When given a private key, the
+public components are exported by default. For symmetric keys (HS*), use
+--private to include the secret material (k) in the output.
+`
+
 type mode int
 
 const (
 	modeInspect mode = iota
 	modeAssertion
+	modeJWKS
 	modeVersion
 )
 
@@ -75,6 +95,17 @@ var clientId string
 var audience string
 var privateKeyPath string
 var kid string
+
+// JWKS flags
+var jwksFlags *flag.FlagSet
+var jwksIn string
+var jwksOut string
+var jwksAlg string
+var jwksUse string
+var jwksKid string
+var jwksIncludePrivate bool
+var jwksUgly bool
+var jwksExt bool
 
 func init() {
 	flag.Usage = func() { fmt.Print(usage) }
@@ -108,6 +139,22 @@ func init() {
 			os.Exit(1)
 		}
 		modeFlag = modeAssertion
+	} else if os.Args[1] == "jwks" {
+		jwksFlags = flag.NewFlagSet("jwks", flag.ExitOnError)
+		jwksFlags.Usage = func() { fmt.Print(jwksUsage) }
+		jwksFlags.StringVar(&jwksIn, "in", "", "Input key file (PEM for RS/ES/EdDSA, certificate, or raw secret for HS*)")
+		jwksFlags.StringVar(&jwksOut, "out", "", "Output JWKS file (defaults to stdout)")
+		jwksFlags.StringVar(&jwksAlg, "alg", "", "Optional alg claim to set on each JWK")
+		jwksFlags.StringVar(&jwksUse, "use", "", "Optional use (e.g., 'sig' or 'enc') to set on each JWK")
+		jwksFlags.StringVar(&jwksKid, "kid", "", "Optional key ID to set (only valid for a single key)")
+		jwksFlags.BoolVar(&jwksIncludePrivate, "private", false, "Include private key material when applicable (not recommended)")
+		jwksFlags.BoolVar(&jwksUgly, "ugly", false, "Don't pretty print output JSON")
+		jwksFlags.BoolVar(&jwksExt, "ext", false, "Set 'ext' (extractable) to true on each JWK")
+		if err := jwksFlags.Parse(os.Args[2:]); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "Error parsing flags: %s\n", err)
+			os.Exit(1)
+		}
+		modeFlag = modeJWKS
 	} else if os.Args[1] == "version" {
 		modeFlag = modeVersion
 	} else {
@@ -121,6 +168,8 @@ func main() {
 		createAssertion()
 	case modeInspect:
 		inspect()
+	case modeJWKS:
+		convertToJWKS()
 	case modeVersion:
 		printVersion()
 	}
@@ -320,6 +369,336 @@ func newJti() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
+// convertToJWKS converts a key file into one or more JWKs and writes a JWKS set.
+func convertToJWKS() {
+	if jwksIn == "" {
+		fmt.Fprintln(os.Stderr, "-in is required")
+		jwksFlags.Usage()
+		os.Exit(1)
+	}
+
+	items, err := parseKeysFromInput(jwksIn)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Error reading input: %s\n", err)
+		os.Exit(1)
+	}
+	if len(items) == 0 {
+		_, _ = fmt.Fprintln(os.Stderr, "No supported keys found in input")
+		os.Exit(1)
+	}
+	if jwksKid != "" && len(items) > 1 {
+		_, _ = fmt.Fprintln(os.Stderr, "--kid is only allowed when exactly one key is present")
+		os.Exit(1)
+	}
+
+	outSet := jwks{Keys: make([]jwk, 0, len(items))}
+	for _, k := range items {
+		j, err := keyToJWK(k, jwksIncludePrivate)
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "Key conversion error: %s\n", err)
+			os.Exit(1)
+		}
+		if jwksAlg != "" {
+			j.Alg = jwksAlg
+		}
+		if jwksUse != "" {
+			j.Use = jwksUse
+		}
+		if jwksKid != "" {
+			j.Kid = jwksKid
+		} else {
+			if kid, err := computeKidForJWK(j); err == nil {
+				j.Kid = kid
+			}
+		}
+		if jwksExt {
+			j.Ext = true
+		}
+		outSet.Keys = append(outSet.Keys, j)
+	}
+
+	var data []byte
+	if jwksUgly {
+		data, err = json.Marshal(outSet)
+	} else {
+		data, err = json.MarshalIndent(outSet, "", "  ")
+	}
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "JWKS marshal error: %s\n", err)
+		os.Exit(1)
+	}
+
+	if jwksOut == "" {
+		fmt.Println(string(data))
+		return
+	}
+	if err := os.WriteFile(jwksOut, data, 0600); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Write JWKS: %s\n", err)
+		os.Exit(1)
+	}
+}
+
+// parseKeysFromInput reads the input file. If it's PEM, it parses all blocks and
+// returns the key(s). If not PEM, treats the content as a raw octet key.
+func parseKeysFromInput(path string) ([]interface{}, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read input: %w", err)
+	}
+	s := string(b)
+	if strings.Contains(s, "-----BEGIN ") {
+		var keys []interface{}
+		rest := b
+		for {
+			var block *pem.Block
+			block, rest = pem.Decode(rest)
+			if block == nil {
+				break
+			}
+			// Reject encrypted private keys explicitly
+			if strings.Contains(strings.ToUpper(block.Type), "ENCRYPTED") {
+				return nil, fmt.Errorf("encrypted private keys are not supported")
+			}
+			k, err := parsePEMBlock(block)
+			if err != nil {
+				return nil, err
+			}
+			if k != nil {
+				keys = append(keys, k)
+			}
+		}
+		return keys, nil
+	}
+	// Not PEM: treat as raw secret (HS*) bytes
+	return []interface{}{b}, nil
+}
+
+func parsePEMBlock(block *pem.Block) (interface{}, error) {
+	t := strings.ToUpper(block.Type)
+	switch t {
+	case "CERTIFICATE":
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse certificate: %w", err)
+		}
+		switch pk := cert.PublicKey.(type) {
+		case *rsa.PublicKey, *ecdsa.PublicKey, ed25519.PublicKey:
+			return pk, nil
+		default:
+			return nil, nil
+		}
+	case "PUBLIC KEY":
+		pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse public key: %w", err)
+		}
+		switch pk := pub.(type) {
+		case *rsa.PublicKey, *ecdsa.PublicKey, ed25519.PublicKey:
+			return pk, nil
+		default:
+			return nil, fmt.Errorf("unsupported public key type")
+		}
+	case "RSA PUBLIC KEY":
+		pk, err := x509.ParsePKCS1PublicKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse RSA public key: %w", err)
+		}
+		return pk, nil
+	case "EC PUBLIC KEY":
+		pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse EC public key: %w", err)
+		}
+		epk, ok := pub.(*ecdsa.PublicKey)
+		if !ok {
+			return nil, fmt.Errorf("not an ECDSA public key")
+		}
+		return epk, nil
+	case "PRIVATE KEY": // PKCS#8
+		priv, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse private key (PKCS#8): %w", err)
+		}
+		switch p := priv.(type) {
+		case *rsa.PrivateKey, *ecdsa.PrivateKey, ed25519.PrivateKey:
+			return p, nil
+		default:
+			return nil, fmt.Errorf("unsupported PKCS#8 private key type")
+		}
+	case "RSA PRIVATE KEY":
+		p, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse RSA private key: %w", err)
+		}
+		return p, nil
+	case "EC PRIVATE KEY":
+		p, err := x509.ParseECPrivateKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse EC private key: %w", err)
+		}
+		return p, nil
+	default:
+		// Best-effort: try PKIX
+		pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+		if err == nil {
+			switch pk := pub.(type) {
+			case *rsa.PublicKey, *ecdsa.PublicKey, ed25519.PublicKey:
+				return pk, nil
+			}
+		}
+		return nil, nil
+	}
+}
+
+func keyToJWK(k interface{}, includePrivate bool) (jwk, error) {
+	switch kt := k.(type) {
+	case *rsa.PrivateKey:
+		if !includePrivate {
+			return rsaPublicToJWK(&kt.PublicKey), nil
+		}
+		return rsaPrivateToJWK(kt), nil
+	case *rsa.PublicKey:
+		return rsaPublicToJWK(kt), nil
+	case *ecdsa.PrivateKey:
+		if !includePrivate {
+			return ecPublicToJWK(&kt.PublicKey)
+		}
+		return ecPrivateToJWK(kt)
+	case *ecdsa.PublicKey:
+		return ecPublicToJWK(kt)
+	case ed25519.PrivateKey:
+		if !includePrivate {
+			return okpPublicToJWK(kt.Public().(ed25519.PublicKey))
+		}
+		return okpPrivateToJWK(kt)
+	case ed25519.PublicKey:
+		return okpPublicToJWK(kt)
+	case []byte:
+		if !includePrivate {
+			return jwk{}, fmt.Errorf("refusing to output symmetric key without --private")
+		}
+		return jwk{Kty: "OCT", K: base64.RawURLEncoding.EncodeToString(kt)}, nil
+	default:
+		return jwk{}, fmt.Errorf("unsupported key type")
+	}
+}
+
+func rsaPublicToJWK(pk *rsa.PublicKey) jwk {
+	n := base64.RawURLEncoding.EncodeToString(pk.N.Bytes())
+	e := base64.RawURLEncoding.EncodeToString(new(big.Int).SetInt64(int64(pk.E)).Bytes())
+	return jwk{Kty: "RSA", N: n, E: e}
+}
+
+func rsaPrivateToJWK(pk *rsa.PrivateKey) jwk {
+	n := base64.RawURLEncoding.EncodeToString(pk.N.Bytes())
+	e := base64.RawURLEncoding.EncodeToString(new(big.Int).SetInt64(int64(pk.E)).Bytes())
+	d := base64.RawURLEncoding.EncodeToString(pk.D.Bytes())
+	return jwk{Kty: "RSA", N: n, E: e, D: d}
+}
+
+func ecPublicToJWK(pk *ecdsa.PublicKey) (jwk, error) {
+	var crv string
+	var size int
+	switch pk.Curve {
+	case elliptic.P256():
+		crv = "P-256"
+		size = 32
+	case elliptic.P384():
+		crv = "P-384"
+		size = 48
+	case elliptic.P521():
+		crv = "P-521"
+		size = 66 // 521 bits rounded up
+	default:
+		return jwk{}, fmt.Errorf("unsupported EC curve")
+	}
+	xb := pk.X.Bytes()
+	yb := pk.Y.Bytes()
+	if len(xb) < size {
+		xb = append(make([]byte, size-len(xb)), xb...)
+	}
+	if len(yb) < size {
+		yb = append(make([]byte, size-len(yb)), yb...)
+	}
+	x := base64.RawURLEncoding.EncodeToString(xb)
+	y := base64.RawURLEncoding.EncodeToString(yb)
+	return jwk{Kty: "EC", Crv: crv, X: x, Y: y}, nil
+}
+
+func ecPrivateToJWK(pk *ecdsa.PrivateKey) (jwk, error) {
+	j, err := ecPublicToJWK(&pk.PublicKey)
+	if err != nil {
+		return jwk{}, err
+	}
+	d := base64.RawURLEncoding.EncodeToString(pk.D.Bytes())
+	j.D = d
+	return j, nil
+}
+
+func okpPublicToJWK(pk ed25519.PublicKey) (jwk, error) {
+	if len(pk) != ed25519.PublicKeySize {
+		return jwk{}, fmt.Errorf("invalid Ed25519 key length")
+	}
+	x := base64.RawURLEncoding.EncodeToString([]byte(pk))
+	return jwk{Kty: "OKP", Crv: "Ed25519", X: x}, nil
+}
+
+func okpPrivateToJWK(pk ed25519.PrivateKey) (jwk, error) {
+	if len(pk) != ed25519.PrivateKeySize {
+		return jwk{}, fmt.Errorf("invalid Ed25519 key length")
+	}
+	x := base64.RawURLEncoding.EncodeToString(pk.Public().(ed25519.PublicKey))
+	d := base64.RawURLEncoding.EncodeToString([]byte(pk.Seed()))
+	return jwk{Kty: "OKP", Crv: "Ed25519", X: x, D: d}, nil
+}
+
+func computeKidForJWK(j jwk) (string, error) {
+	switch strings.ToUpper(j.Kty) {
+	case "RSA":
+		type rsaThumb struct {
+			E   string `json:"e"`
+			Kty string `json:"kty"`
+			N   string `json:"n"`
+		}
+		t := rsaThumb{E: j.E, Kty: "RSA", N: j.N}
+		b, _ := json.Marshal(t)
+		h := sha256.Sum256(b)
+		return base64.RawURLEncoding.EncodeToString(h[:]), nil
+	case "EC":
+		type ecThumb struct {
+			Crv string `json:"crv"`
+			Kty string `json:"kty"`
+			X   string `json:"x"`
+			Y   string `json:"y"`
+		}
+		t := ecThumb{Crv: j.Crv, Kty: "EC", X: j.X, Y: j.Y}
+		b, _ := json.Marshal(t)
+		h := sha256.Sum256(b)
+		return base64.RawURLEncoding.EncodeToString(h[:]), nil
+	case "OKP":
+		type okpThumb struct {
+			Crv string `json:"crv"`
+			Kty string `json:"kty"`
+			X   string `json:"x"`
+		}
+		t := okpThumb{Crv: j.Crv, Kty: "OKP", X: j.X}
+		b, _ := json.Marshal(t)
+		h := sha256.Sum256(b)
+		return base64.RawURLEncoding.EncodeToString(h[:]), nil
+	case "OCT":
+		type octThumb struct {
+			K   string `json:"k"`
+			Kty string `json:"kty"`
+		}
+		t := octThumb{K: j.K, Kty: "oct"}
+		b, _ := json.Marshal(t)
+		h := sha256.Sum256(b)
+		return base64.RawURLEncoding.EncodeToString(h[:]), nil
+	default:
+		return "", fmt.Errorf("unsupported kty for kid computation")
+	}
+}
+
 func loadVerifyKey(alg string, keyPath string) (interface{}, error) {
 	data, err := os.ReadFile(keyPath)
 	if err != nil {
@@ -367,6 +746,8 @@ type jwk struct {
 	Kid string `json:"kid,omitempty"`
 	Use string `json:"use,omitempty"`
 	Alg string `json:"alg,omitempty"`
+	// Private key fields (optional)
+	D string `json:"d,omitempty"`
 	// RSA
 	N string `json:"n,omitempty"`
 	E string `json:"e,omitempty"`
@@ -375,7 +756,8 @@ type jwk struct {
 	X   string `json:"x,omitempty"`
 	Y   string `json:"y,omitempty"`
 	// OCT (HMAC)
-	K string `json:"k,omitempty"`
+	K   string `json:"k,omitempty"`
+	Ext bool   `json:"ext,omitempty"`
 }
 
 type jwks struct {
@@ -503,7 +885,12 @@ func readRef(ref string) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("fetch JWKS: %w", err)
 		}
-		defer resp.Body.Close()
+		defer func(Body io.ReadCloser) {
+			err := Body.Close()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: error closing response body: %s\n", err)
+			}
+		}(resp.Body)
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return nil, fmt.Errorf("fetch JWKS: HTTP %d", resp.StatusCode)
 		}

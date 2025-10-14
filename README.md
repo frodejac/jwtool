@@ -33,6 +33,7 @@ usage: jwtool [option...] [JWT]
   --verify         verify the JWT signature
   --key            path to verification key (PEM for RS/ES/EdDSA, or raw secret file for HS*)
   --jwks           path or URL to JWKS (used with --verify)
+  jwks           convert keys to JWKS
   assertion       generate a client assertion JWT
   version         print version information
 
@@ -107,6 +108,55 @@ Additional examples (verification):
   ```bash
   jwtool --verify --jwks https://issuer.example.com/.well-known/jwks.json "$JWT"
   ```
+
+### Convert Keys to JWKS
+
+Convert various key formats (PEM public/private keys, certificates, or raw HMAC secrets) into a JWKS file:
+
+```
+usage: jwtool jwks [option...]
+  -in <path>           Input key file (PEM for RS/ES/EdDSA, certificate, or raw secret for HS*)
+  -out <path>          Output JWKS file (defaults to stdout)
+  --alg <alg>          Optional alg claim to set on each JWK
+  --use <use>          Optional use (e.g., 'sig' or 'enc') to set on each JWK
+  --kid <kid>          Optional key ID to set (only valid for a single key)
+  --private            Include private key material when applicable (not recommended)
+  --ext                Set "ext" (extractable) to true on each JWK
+  --ugly               Don't pretty-print output
+```
+
+Examples:
+
+- RSA private key to JWKS (exports public components by default):
+  ```bash
+  jwtool jwks -in private.pem -out jwks.json
+  ```
+
+- RSA private key to JWKS with private components:
+  ```bash
+  jwtool jwks -in private.pem -out jwks.json --private
+  ```
+
+- EC public key to JWKS:
+  ```bash
+  jwtool jwks -in ec_pub.pem -out jwks.json
+  ```
+
+- Certificate to JWKS (uses certificate public key):
+  ```bash
+  jwtool jwks -in cert.pem -out jwks.json
+  ```
+
+- HMAC shared secret to JWKS (requires --private):
+  ```bash
+  printf 'super-secret' > secret.key
+  jwtool jwks -in secret.key --private -out jwks.json
+  ```
+
+Notes:
+- By default, `jwks` exports only public key material. For symmetric keys (HS*), there is no public component; `--private` is required to include the secret (`k`).
+- `kid` is computed from the JWK thumbprint (RFC 7638) unless `--kid` is provided.
+- If multiple keys are present in the input (e.g., multiple PEM blocks), all keys are exported; `--kid` may only be used when exactly one key is present.
 
 ### Generate Client Assertion
 
