@@ -593,7 +593,25 @@ func rsaPrivateToJWK(pk *rsa.PrivateKey) jwk {
 	n := base64.RawURLEncoding.EncodeToString(pk.N.Bytes())
 	e := base64.RawURLEncoding.EncodeToString(new(big.Int).SetInt64(int64(pk.E)).Bytes())
 	d := base64.RawURLEncoding.EncodeToString(pk.D.Bytes())
-	return jwk{Kty: "RSA", N: n, E: e, D: d}
+	// Ensure CRT values are computed for dp/dq/qi/oth
+	if pk.Precomputed.Dp == nil || pk.Precomputed.Dq == nil || pk.Precomputed.Qinv == nil {
+		pk.Precompute()
+	}
+	var p, q, dp, dq, qi string
+	if len(pk.Primes) >= 2 {
+		p = base64.RawURLEncoding.EncodeToString(pk.Primes[0].Bytes())
+		q = base64.RawURLEncoding.EncodeToString(pk.Primes[1].Bytes())
+	}
+	if pk.Precomputed.Dp != nil {
+		dp = base64.RawURLEncoding.EncodeToString(pk.Precomputed.Dp.Bytes())
+	}
+	if pk.Precomputed.Dq != nil {
+		dq = base64.RawURLEncoding.EncodeToString(pk.Precomputed.Dq.Bytes())
+	}
+	if pk.Precomputed.Qinv != nil {
+		qi = base64.RawURLEncoding.EncodeToString(pk.Precomputed.Qinv.Bytes())
+	}
+	return jwk{Kty: "RSA", N: n, E: e, D: d, P: p, Q: q, Dp: dp, Dq: dq, Qi: qi}
 }
 
 func ecPublicToJWK(pk *ecdsa.PublicKey) (jwk, error) {
@@ -748,6 +766,12 @@ type jwk struct {
 	Alg string `json:"alg,omitempty"`
 	// Private key fields (optional)
 	D string `json:"d,omitempty"`
+	// RSA private key CRT parameters
+	P  string `json:"p,omitempty"`
+	Q  string `json:"q,omitempty"`
+	Dp string `json:"dp,omitempty"`
+	Dq string `json:"dq,omitempty"`
+	Qi string `json:"qi,omitempty"`
 	// RSA
 	N string `json:"n,omitempty"`
 	E string `json:"e,omitempty"`
