@@ -15,16 +15,18 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/golang-jwt/jwt/v5"
-	"golang.org/x/term"
-	"io"
 	"math/big"
 	"net/http"
 	"net/url"
 	"os"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/term"
+	"io"
 )
 
 const usage = `usage: jwtool [option...] [JWT]
@@ -34,6 +36,7 @@ const usage = `usage: jwtool [option...] [JWT]
   --verify         verify the JWT signature
   --key            path to verification key (PEM for RS/ES/EdDSA, or raw secret file for HS*)
   --jwks           path or URL to JWKS (used with --verify)
+  generate        generate a signed JWT with arbitrary claims
   jwks           convert keys to JWKS
   assertion       generate a client assertion JWT
   version         print version information
@@ -71,6 +74,56 @@ public components are exported by default. For symmetric keys (HS*), use
 --private to include the secret material (k) in the output.
 `
 
+const generateUsage = `usage: jwtool generate [option...]
+  --alg <alg>       Signing algorithm (required): HS256/384/512, RS256/384/512, ES256/384/512, EdDSA
+  --key <path>      Path to signing key (required): PEM private key or raw HMAC secret file
+  --kid <kid>       Key ID header
+  --typ <typ>       Token type header (default: "JWT")
+  --iss <iss>       Issuer
+  --sub <sub>       Subject
+  --aud <aud>       Audience (repeatable; single value → string, multiple → array)
+  --exp <exp>       Expiration: Go duration relative to now (e.g. 1h) or Unix timestamp
+  --nbf <nbf>       Not before: Go duration relative to now or Unix timestamp
+  --iat <iat>       Issued at: Unix timestamp (default: now)
+  --jti <jti>       JWT ID (default: auto-generated)
+  --scope <scope>   Scope claim
+  --nonce <nonce>   Nonce claim
+  --azp <azp>       Authorized party
+  --acr <acr>       Auth context class reference
+  --claim key=value Arbitrary claim (repeatable, auto-detects value type)
+  -h, --help        print this help and exit
+
+Generate a signed JWT with the specified claims and signing key.
+`
+
+// stringSlice implements flag.Value for repeatable --aud flags.
+type stringSlice []string
+
+func (s *stringSlice) String() string { return strings.Join(*s, ",") }
+func (s *stringSlice) Set(val string) error {
+	*s = append(*s, val)
+	return nil
+}
+
+// claimEntry represents a single key=value claim pair.
+type claimEntry struct {
+	Key   string
+	Value string
+}
+
+// claimList implements flag.Value for repeatable --claim key=value flags.
+type claimList []claimEntry
+
+func (c *claimList) String() string { return "" }
+func (c *claimList) Set(val string) error {
+	idx := strings.IndexByte(val, '=')
+	if idx < 1 {
+		return fmt.Errorf("invalid claim %q: expected key=value", val)
+	}
+	*c = append(*c, claimEntry{Key: val[:idx], Value: val[idx+1:]})
+	return nil
+}
+
 type mode int
 
 const (
@@ -78,6 +131,7 @@ const (
 	modeAssertion
 	modeJWKS
 	modeVersion
+	modeGenerate
 )
 
 var modeFlag mode
@@ -95,6 +149,25 @@ var clientId string
 var audience string
 var privateKeyPath string
 var kid string
+
+// Generate flags
+var generateFlags *flag.FlagSet
+var genAlg string
+var genKey string
+var genKid string
+var genTyp string
+var genIss string
+var genSub string
+var genAud stringSlice
+var genExp string
+var genNbf string
+var genIat string
+var genJti string
+var genScope string
+var genNonce string
+var genAzp string
+var genAcr string
+var genClaims claimList
 
 // JWKS flags
 var jwksFlags *flag.FlagSet
@@ -139,6 +212,30 @@ func init() {
 			os.Exit(1)
 		}
 		modeFlag = modeAssertion
+	} else if os.Args[1] == "generate" {
+		generateFlags = flag.NewFlagSet("generate", flag.ExitOnError)
+		generateFlags.Usage = func() { fmt.Print(generateUsage) }
+		generateFlags.StringVar(&genAlg, "alg", "", "Signing algorithm")
+		generateFlags.StringVar(&genKey, "key", "", "Path to signing key")
+		generateFlags.StringVar(&genKid, "kid", "", "Key ID header")
+		generateFlags.StringVar(&genTyp, "typ", "JWT", "Token type header")
+		generateFlags.StringVar(&genIss, "iss", "", "Issuer")
+		generateFlags.StringVar(&genSub, "sub", "", "Subject")
+		generateFlags.Var(&genAud, "aud", "Audience (repeatable)")
+		generateFlags.StringVar(&genExp, "exp", "", "Expiration: duration or Unix timestamp")
+		generateFlags.StringVar(&genNbf, "nbf", "", "Not before: duration or Unix timestamp")
+		generateFlags.StringVar(&genIat, "iat", "", "Issued at: Unix timestamp")
+		generateFlags.StringVar(&genJti, "jti", "", "JWT ID")
+		generateFlags.StringVar(&genScope, "scope", "", "Scope claim")
+		generateFlags.StringVar(&genNonce, "nonce", "", "Nonce claim")
+		generateFlags.StringVar(&genAzp, "azp", "", "Authorized party")
+		generateFlags.StringVar(&genAcr, "acr", "", "Auth context class reference")
+		generateFlags.Var(&genClaims, "claim", "Arbitrary key=value claim (repeatable)")
+		if err := generateFlags.Parse(os.Args[2:]); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "Error parsing flags: %s\n", err)
+			os.Exit(1)
+		}
+		modeFlag = modeGenerate
 	} else if os.Args[1] == "jwks" {
 		jwksFlags = flag.NewFlagSet("jwks", flag.ExitOnError)
 		jwksFlags.Usage = func() { fmt.Print(jwksUsage) }
@@ -172,6 +269,8 @@ func main() {
 		convertToJWKS()
 	case modeVersion:
 		printVersion()
+	case modeGenerate:
+		generateToken()
 	}
 }
 
@@ -899,6 +998,207 @@ func jwkToKey(j jwk) (interface{}, error) {
 
 func b64urlDecode(s string) ([]byte, error) {
 	return base64.RawURLEncoding.DecodeString(s)
+}
+
+func signingMethodFromAlg(alg string) (jwt.SigningMethod, error) {
+	switch strings.ToUpper(alg) {
+	case "HS256":
+		return jwt.SigningMethodHS256, nil
+	case "HS384":
+		return jwt.SigningMethodHS384, nil
+	case "HS512":
+		return jwt.SigningMethodHS512, nil
+	case "RS256":
+		return jwt.SigningMethodRS256, nil
+	case "RS384":
+		return jwt.SigningMethodRS384, nil
+	case "RS512":
+		return jwt.SigningMethodRS512, nil
+	case "ES256":
+		return jwt.SigningMethodES256, nil
+	case "ES384":
+		return jwt.SigningMethodES384, nil
+	case "ES512":
+		return jwt.SigningMethodES512, nil
+	case "EDDSA":
+		return jwt.SigningMethodEdDSA, nil
+	default:
+		return nil, fmt.Errorf("unsupported algorithm: %s", alg)
+	}
+}
+
+func loadSigningKey(alg, keyPath string) (interface{}, error) {
+	keys, err := parseKeysFromInput(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("no keys found in %s", keyPath)
+	}
+	key := keys[0]
+
+	a := strings.ToUpper(alg)
+	switch {
+	case strings.HasPrefix(a, "HS"):
+		if b, ok := key.([]byte); ok {
+			return b, nil
+		}
+		return nil, fmt.Errorf("HMAC algorithms require a raw secret key, got %T", key)
+	case strings.HasPrefix(a, "RS"):
+		if pk, ok := key.(*rsa.PrivateKey); ok {
+			return pk, nil
+		}
+		return nil, fmt.Errorf("RSA algorithms require an *rsa.PrivateKey, got %T", key)
+	case strings.HasPrefix(a, "ES"):
+		if pk, ok := key.(*ecdsa.PrivateKey); ok {
+			return pk, nil
+		}
+		return nil, fmt.Errorf("EC algorithms require an *ecdsa.PrivateKey, got %T", key)
+	case a == "EDDSA":
+		if pk, ok := key.(ed25519.PrivateKey); ok {
+			return pk, nil
+		}
+		return nil, fmt.Errorf("EdDSA requires an ed25519.PrivateKey, got %T", key)
+	default:
+		return nil, fmt.Errorf("unsupported algorithm: %s", alg)
+	}
+}
+
+func parseTimeFlag(val string, now time.Time) (int64, error) {
+	if d, err := time.ParseDuration(val); err == nil {
+		return now.Add(d).Unix(), nil
+	}
+	ts, err := strconv.ParseInt(val, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid time value %q: expected Go duration (e.g. 1h) or Unix timestamp", val)
+	}
+	return ts, nil
+}
+
+func parseClaimValue(raw string) interface{} {
+	if raw == "true" {
+		return true
+	}
+	if raw == "false" {
+		return false
+	}
+	if i, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		return i
+	}
+	if f, err := strconv.ParseFloat(raw, 64); err == nil {
+		return f
+	}
+	if (strings.HasPrefix(raw, "{") && strings.HasSuffix(raw, "}")) ||
+		(strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]")) {
+		var v interface{}
+		if err := json.Unmarshal([]byte(raw), &v); err == nil {
+			return v
+		}
+	}
+	return raw
+}
+
+func generateToken() {
+	if genAlg == "" || genKey == "" {
+		_, _ = fmt.Fprintln(os.Stderr, "--alg and --key are required")
+		generateFlags.Usage()
+		os.Exit(1)
+	}
+
+	method, err := signingMethodFromAlg(genAlg)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+		os.Exit(1)
+	}
+
+	key, err := loadSigningKey(genAlg, genKey)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Error loading signing key: %s\n", err)
+		os.Exit(1)
+	}
+
+	now := time.Now().UTC()
+	claims := jwt.MapClaims{}
+
+	// Default iat to now
+	claims["iat"] = now.Unix()
+
+	// Default jti to auto-generated
+	jtiVal, err := newJti()
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Error generating jti: %s\n", err)
+		os.Exit(1)
+	}
+	claims["jti"] = jtiVal
+
+	if genIss != "" {
+		claims["iss"] = genIss
+	}
+	if genSub != "" {
+		claims["sub"] = genSub
+	}
+	if len(genAud) == 1 {
+		claims["aud"] = genAud[0]
+	} else if len(genAud) > 1 {
+		claims["aud"] = []string(genAud)
+	}
+	if genExp != "" {
+		v, err := parseTimeFlag(genExp, now)
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "Error parsing --exp: %s\n", err)
+			os.Exit(1)
+		}
+		claims["exp"] = v
+	}
+	if genNbf != "" {
+		v, err := parseTimeFlag(genNbf, now)
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "Error parsing --nbf: %s\n", err)
+			os.Exit(1)
+		}
+		claims["nbf"] = v
+	}
+	if genIat != "" {
+		ts, err := strconv.ParseInt(genIat, 10, 64)
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "Error parsing --iat: expected Unix timestamp\n")
+			os.Exit(1)
+		}
+		claims["iat"] = ts
+	}
+	if genJti != "" {
+		claims["jti"] = genJti
+	}
+	if genScope != "" {
+		claims["scope"] = genScope
+	}
+	if genNonce != "" {
+		claims["nonce"] = genNonce
+	}
+	if genAzp != "" {
+		claims["azp"] = genAzp
+	}
+	if genAcr != "" {
+		claims["acr"] = genAcr
+	}
+
+	// Apply arbitrary claims last (intentionally overrides named flags)
+	for _, c := range genClaims {
+		claims[c.Key] = parseClaimValue(c.Value)
+	}
+
+	token := jwt.NewWithClaims(method, claims)
+	token.Header["typ"] = genTyp
+	if genKid != "" {
+		token.Header["kid"] = genKid
+	}
+
+	tokenString, err := token.SignedString(key)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Error signing token: %s\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(tokenString)
 }
 
 func readRef(ref string) ([]byte, error) {
